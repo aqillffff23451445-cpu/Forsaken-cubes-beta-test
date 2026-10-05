@@ -144,10 +144,10 @@ function loadMap(){
 
     // 3) Осознанный масштаб.
     // Исходная карта имеет ширину около 3.14.
-    // Масштаб 5 даёт игровую ширину около 15.7, что согласуется
-    // с существующим серверным spawn-диапазоном примерно -5..+5
-    // и кубиком игрока размером 1.
-    const MAP_SCALE=5;
+    // Масштаб 20 увеличивает текущую карту в 4 раза.
+    // Игроки по-прежнему стартуют в центральной части карты,
+    // а границы движения пересчитываются автоматически.
+    const MAP_SCALE=20;
     mapRoot.scale.setScalar(MAP_SCALE);
     mapRoot.updateWorldMatrix(true,true);
 
@@ -203,7 +203,7 @@ function initThree(){
   scene=new THREE.Scene();
   scene.background=new THREE.Color(0x0d0d14);
 
-  camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,100);
+  camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,300);
   camera.position.set(0,11,13);
 
   renderer=new THREE.WebGLRenderer({antialias:true});
@@ -262,6 +262,17 @@ socket.on('errorMsg',m=>{
 // Для этой GLB используем именно найденный groundMesh,
 // поэтому толстая нижняя часть карты не становится полом.
 const groundRaycaster=new THREE.Raycaster();
+const obstacleRaycaster=new THREE.Raycaster();
+const obstacleDirections=[
+  new THREE.Vector3(1,0,0),
+  new THREE.Vector3(-1,0,0),
+  new THREE.Vector3(0,0,1),
+  new THREE.Vector3(0,0,-1),
+  new THREE.Vector3(0.707,0,0.707),
+  new THREE.Vector3(-0.707,0,0.707),
+  new THREE.Vector3(0.707,0,-0.707),
+  new THREE.Vector3(-0.707,0,-0.707)
+];
 
 function getGroundY(x,z){
   if(!groundMesh)return null;
@@ -276,6 +287,47 @@ function getGroundY(x,z){
   if(!hits.length)return null;
 
   return hits[0].point.y;
+}
+
+function canStandAt(x,z,playerSize){
+  if(!mapRoot)return true;
+
+  const radius=Math.max(0.38,playerSize*0.52);
+  const bodyY=getGroundY(x,z);
+  if(bodyY===null)return false;
+
+  // Проверяем пространство вокруг кубика на уровне его корпуса.
+  // Горизонтальные поверхности (земля/крыша) не считаются стенами.
+  const heights=[bodyY+radius*0.7, bodyY+radius*1.5];
+  for(const dir of obstacleDirections){
+    for(const y of heights){
+      const origin=new THREE.Vector3(
+        x-dir.x*0.05,
+        y,
+        z-dir.z*0.05
+      );
+      obstacleRaycaster.set(origin,dir);
+      obstacleRaycaster.far=radius+0.12;
+
+      const hits=obstacleRaycaster.intersectObject(mapRoot,true);
+      for(const hit of hits){
+        if(!hit.object.isMesh || hit.distance<=0)continue;
+        if(hit.object===groundMesh)continue;
+
+        // Проверяем нормаль поверхности: вертикальная/наклонная поверхность
+        // блокирует движение, а горизонтальная поверхность остаётся полом.
+        let normalY=1;
+        if(hit.face){
+          const n=hit.face.normal.clone();
+          const normalMatrix=new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+          n.applyMatrix3(normalMatrix).normalize();
+          normalY=Math.abs(n.y);
+        }
+        if(normalY<0.75)return false;
+      }
+    }
+  }
+  return true;
 }
 
 function placeOnGround(player){
@@ -401,7 +453,8 @@ function loop(){
 
       // Не двигаем игрока в область, где настоящей поверхности GLB нет.
       const nextY=getGroundY(nextX,nextZ);
-      if(nextY!==null){
+      const playerSize=(me.mesh.geometry.parameters?.width||1);
+      if(nextY!==null && canStandAt(nextX,nextZ,playerSize)){
         me.mesh.position.x=nextX;
         me.mesh.position.z=nextZ;
         me.mesh.position.y=nextY+((me.mesh.geometry.parameters?.height||1)*0.5);
