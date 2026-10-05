@@ -69,7 +69,7 @@ input{background:#1a1a28;border:2px solid #444;color:#fff;padding:12px;border-ra
 const socket=io();
 let myId=null,isKiller=false,gameStarted=false,players={},myHp=100;
 let joy={x:0,y:0};
-let scene,camera,renderer,mapRoot=null,mapBounds=null;
+let scene,camera,renderer,mapRoot=null,mapBounds=null,groundMesh=null;
 let mapReady=false;
 let mapHalfX=8,mapHalfZ=8;
 
@@ -79,41 +79,111 @@ function setStatus(t){
 
 function loadMap(){
   const loader=new THREE.GLTFLoader();
+
   loader.load('/map.glb',(gltf)=>{
     mapRoot=gltf.scene;
 
-    // Automatically fit the map to a reasonable game size.
-    const rawBox=new THREE.Box3().setFromObject(mapRoot);
+    // 1) Сначала изучаем GLB без изменения масштаба.
+    mapRoot.updateWorldMatrix(true,true);
+    const rawBox=new THREE.Box3().setFromObject(mapRoot,true);
     const rawSize=rawBox.getSize(new THREE.Vector3());
-    const maxDim=Math.max(rawSize.x,rawSize.y,rawSize.z);
 
-    if(!isFinite(maxDim)||maxDim<=0){
-      throw new Error('GLB имеет неправильный размер');
+    console.log('GLB MAP SIZE:', rawSize);
+    console.log('GLB MAP MIN:', rawBox.min);
+    console.log('GLB MAP MAX:', rawBox.max);
+
+    // 2) Ищем настоящую нижнюю игровую площадку.
+    // В этой карте это самый большой горизонтальный Mesh (Part360...).
+    // Мы НЕ используем min.y всей GLB: под поверхностью есть толстый нижний слой.
+    groundMesh=null;
+    let largestArea=0;
+
+    mapRoot.traverse(obj=>{
+      if(!obj.isMesh) return;
+
+      obj.updateWorldMatrix(true,false);
+      const b=new THREE.Box3().setFromObject(obj,true);
+      const s=b.getSize(new THREE.Vector3());
+      const area=s.x*s.z;
+
+      if(area>largestArea){
+        largestArea=area;
+        groundMesh=obj;
+      }
+
+      // Диагностика материалов.
+      const materials=Array.isArray(obj.material)?obj.material:[obj.material];
+      materials.forEach(material=>{
+        if(!material) return;
+        console.log('MATERIAL:',{
+          mesh:obj.name,
+          material:material.name,
+          transparent:material.transparent,
+          opacity:material.opacity,
+          alphaTest:material.alphaTest,
+          depthWrite:material.depthWrite,
+          side:material.side
+        });
+
+        // Только явно непрозрачные материалы приводим к нормальному
+        // состоянию. Материалы GLB с прозрачностью не трогаем.
+        if(material.transparent!==true && material.opacity>=1){
+          material.transparent=false;
+          material.opacity=1;
+          material.depthWrite=true;
+          material.needsUpdate=true;
+        }
+      });
+    });
+
+    if(!groundMesh){
+      throw new Error('Не удалось найти Mesh игровой поверхности');
     }
 
-    const TARGET_SIZE=18;
-    const scale=TARGET_SIZE/maxDim;
-    mapRoot.scale.setScalar(scale);
-    mapRoot.updateMatrixWorld(true);
+    console.log('GROUND MESH:',groundMesh.name);
 
-    // Center X/Z and put the lowest point on the game floor.
-    let box=new THREE.Box3().setFromObject(mapRoot);
-    const center=box.getCenter(new THREE.Vector3());
-    mapRoot.position.x-=center.x;
-    mapRoot.position.z-=center.z;
-    mapRoot.position.y-=box.min.y;
-    mapRoot.updateMatrixWorld(true);
+    // 3) Осознанный масштаб.
+    // Исходная карта имеет ширину около 3.14.
+    // Масштаб 5 даёт игровую ширину около 15.7, что согласуется
+    // с существующим серверным spawn-диапазоном примерно -5..+5
+    // и кубиком игрока размером 1.
+    const MAP_SCALE=5;
+    mapRoot.scale.setScalar(MAP_SCALE);
+    mapRoot.updateWorldMatrix(true,true);
 
-    box=new THREE.Box3().setFromObject(mapRoot);
-    mapBounds=box;
-    mapHalfX=Math.max(2,(box.max.x-box.min.x)/2-0.6);
-    mapHalfZ=Math.max(2,(box.max.z-box.min.z)/2-0.6);
+    // 4) Центрируем карту по X/Z.
+    // 5) Поднимаем карту так, чтобы ВЕРХ большой нижней площадки был y=0.
+    // Это ключевое отличие от старого варианта, где использовался box.min.y.
+    let groundBox=new THREE.Box3().setFromObject(groundMesh,true);
+    const groundCenter=groundBox.getCenter(new THREE.Vector3());
+
+    mapRoot.position.x-=groundCenter.x;
+    mapRoot.position.z-=groundCenter.z;
+    mapRoot.position.y-=groundBox.max.y;
+    mapRoot.updateWorldMatrix(true,true);
+
+    // Пересчитываем границы уже после трансформации.
+    groundBox=new THREE.Box3().setFromObject(groundMesh,true);
+    mapBounds=new THREE.Box3().setFromObject(mapRoot,true);
+
+    console.log('GAME MAP SIZE:',mapBounds.getSize(new THREE.Vector3()));
+    console.log('GROUND TOP Y:',groundBox.max.y);
+    console.log('GROUND BOUNDS:',groundBox.min,groundBox.max);
+
+    // Границы движения берём с реальной игровой площадки,
+    // а не со всей GLB-модели.
+    const groundSize=groundBox.getSize(new THREE.Vector3());
+    mapHalfX=Math.max(2,groundSize.x/2-0.65);
+    mapHalfZ=Math.max(2,groundSize.z/2-0.65);
 
     scene.add(mapRoot);
 
-    // Fog adapts to the actual map size.
-    const diagonal=Math.hypot(box.max.x-box.min.x,box.max.z-box.min.z);
-    scene.fog=new THREE.Fog(0x0d0d14,Math.max(18,diagonal*0.7),Math.max(35,diagonal*1.8));
+    const diagonal=Math.hypot(groundSize.x,groundSize.z);
+    scene.fog=new THREE.Fog(
+      0x0d0d14,
+      Math.max(18,diagonal*0.9),
+      Math.max(35,diagonal*2.2)
+    );
 
     mapReady=true;
     document.getElementById('loading').style.display='none';
@@ -139,6 +209,8 @@ function initThree(){
   renderer=new THREE.WebGLRenderer({antialias:true});
   renderer.setSize(innerWidth,innerHeight);
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.outputEncoding=THREE.sRGBEncoding;
+  renderer.sortObjects=true;
   document.body.appendChild(renderer.domElement);
 
   scene.add(new THREE.AmbientLight(0xffffff,0.65));
@@ -147,8 +219,8 @@ function initThree(){
   scene.add(d);
 }
 
-loadMap();
 initThree();
+loadMap();
 
 document.getElementById('btnCreate').onclick=()=>socket.emit('createRoom','P'+Math.floor(Math.random()*90+10));
 document.getElementById('btnJoin').onclick=()=>{
@@ -185,6 +257,38 @@ socket.on('errorMsg',m=>{
   document.getElementById('status').textContent=m;
   document.getElementById('status2').textContent=m;
 });
+
+// Реальная высота поверхности под игроком.
+// Для этой GLB используем именно найденный groundMesh,
+// поэтому толстая нижняя часть карты не становится полом.
+const groundRaycaster=new THREE.Raycaster();
+
+function getGroundY(x,z){
+  if(!groundMesh)return null;
+
+  const originY=(mapBounds?mapBounds.max.y:20)+10;
+  groundRaycaster.set(
+    new THREE.Vector3(x,originY,z),
+    new THREE.Vector3(0,-1,0)
+  );
+
+  const hits=groundRaycaster.intersectObject(groundMesh,true);
+  if(!hits.length)return null;
+
+  return hits[0].point.y;
+}
+
+function placeOnGround(player){
+  if(!player||!player.mesh)return;
+
+  const halfHeight=(player.mesh.geometry.parameters?.height || 1)*0.5;
+  const y=getGroundY(player.mesh.position.x,player.mesh.position.z);
+
+  if(y!==null){
+    player.mesh.position.y=y+halfHeight;
+  }
+}
+
 socket.on('gameStart',data=>{
   players=data.players;
   isKiller=data.killerId===myId;
@@ -203,12 +307,14 @@ socket.on('gameStart',data=>{
   Object.values(players).forEach(p=>{
     p.mesh=makeCube(p.color,p.isKiller?1.35:1);
     p.mesh.position.set(
-      Math.max(-mapHalfX+1,Math.min(mapHalfX-1,p.x)),
-      0.5,
-      Math.max(-mapHalfZ+1,Math.min(mapHalfZ-1,p.z))
+      Math.max(-mapHalfX,Math.min(mapHalfX,p.x)),
+      0,
+      Math.max(-mapHalfZ,Math.min(mapHalfZ,p.z))
     );
-    p.x=p.mesh.position.x;p.z=p.mesh.position.z;
     scene.add(p.mesh);
+    placeOnGround(p);
+    p.x=p.mesh.position.x;
+    p.z=p.mesh.position.z;
   });
   loop();
 });
@@ -290,10 +396,19 @@ function loop(){
       const sp=SPEED*(isKiller?1.3:1);
       dx=(dx/len)*sp;dz=(dz/len)*sp;
 
-      me.mesh.position.x=Math.max(-mapHalfX,Math.min(mapHalfX,me.mesh.position.x+dx));
-      me.mesh.position.z=Math.max(-mapHalfZ,Math.min(mapHalfZ,me.mesh.position.z+dz));
-      me.x=me.mesh.position.x;me.z=me.mesh.position.z;
-      socket.emit('move',{x:me.x,z:me.z});
+      const nextX=Math.max(-mapHalfX,Math.min(mapHalfX,me.mesh.position.x+dx));
+      const nextZ=Math.max(-mapHalfZ,Math.min(mapHalfZ,me.mesh.position.z+dz));
+
+      // Не двигаем игрока в область, где настоящей поверхности GLB нет.
+      const nextY=getGroundY(nextX,nextZ);
+      if(nextY!==null){
+        me.mesh.position.x=nextX;
+        me.mesh.position.z=nextZ;
+        me.mesh.position.y=nextY+((me.mesh.geometry.parameters?.height||1)*0.5);
+        me.x=me.mesh.position.x;
+        me.z=me.mesh.position.z;
+        socket.emit('move',{x:me.x,z:me.z});
+      }
     }
   }
 
@@ -301,13 +416,18 @@ function loop(){
     if(p.id===myId||!p.mesh||p.targetX===undefined)return;
     p.mesh.position.x+=(p.targetX-p.mesh.position.x)*0.2;
     p.mesh.position.z+=(p.targetZ-p.mesh.position.z)*0.2;
+    const remoteY=getGroundY(p.mesh.position.x,p.mesh.position.z);
+    if(remoteY!==null){
+      p.mesh.position.y=remoteY+((p.mesh.geometry.parameters?.height||1)*0.5);
+    }
   });
 
   if(me&&me.mesh){
     const t=me.mesh.position;
     camera.position.x+=(t.x-camera.position.x)*0.05;
+    camera.position.y+=((t.y+11)-camera.position.y)*0.05;
     camera.position.z+=(t.z+12-camera.position.z)*0.05;
-    camera.lookAt(t.x,0,t.z);
+    camera.lookAt(t.x,t.y,t.z);
   }
 
   renderer.render(scene,camera);
